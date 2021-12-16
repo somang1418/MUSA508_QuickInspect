@@ -1,6 +1,6 @@
 # MUSA508_QuickInspect
 
-![](picture/tsp_plot1.png)<!-- -->
+![](/app.png)<!-- -->
 
 
 ### Team Underfit (Somang Han & Lance Lepelstat)
