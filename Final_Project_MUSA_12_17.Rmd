@@ -1,0 +1,1227 @@
+---
+title: "MUSA 508 Final Project: QuickInspect"
+author: "Team Underfit (Somang Han & Lance Lepelstat)"
+date: "12/17/2021"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+# 1. Introduction/Motivation
+
+The City of Chicago's Department of Public Health performs inspections of food establishments in order to observe health code violations to improve food safety and public health. Because there are a limited number of inspections that can be performed, the department must determine the best way to allocate their resources. Data can be used to develop a model to predict whether an individual establishment will fail inspection. A health inspector can then use these predictions to prioritize inspecting establishments predicted to fail and catch violations earlier. These predictions can be incorporated into a mobile app (QuickInspect) to streamline the process.
+
+The analysis presented here can be replicated by any stakeholders who want to improve the health inspection process in Chicago or elsewhere. By collecting data and incorporating it into a model similar to our logistic regression, other cities could enjoy the benefits of generating predictions of health inspection failures.
+
+In this assignment, we build a predictive model based on various risk factors, including a number of 311 requests, presence of food amenities, and nearest neighbor distances to the above mentioned. We analyze the performance of our model across different neighborhoods, race groups, and establishment types. We also conduct a cost benefit analysis to examine economic impacts.
+
+<a href="https://youtu.be/WF3tLg38mvs">Link to presentation video</a>
+
+# 2. Setup 
+
+```{r setup, include=FALSE}
+# Import libraries
+library(tidyverse)
+library(caret)
+library(knitr) 
+library(pscl)
+library(plotROC)
+library(pROC)
+library(scales)
+library(kableExtra)
+library(memisc)
+library(stargazer)
+library(tidycensus)
+library(sf)
+library(spdep)
+library(FNN)
+library(grid)
+library(osmdata)
+library(gridExtra)
+library(viridis)
+library(RSocrata)
+library(lubridate)
+
+
+# Get helper functions
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+
+
+# Set color palettes
+palette5 <- c("#981FAC","#CB0F8B","#FF006A","#FE4C35","#FE9900")
+palette4 <- c("#981FAC","#FF006A","#FE4C35","#FE9900")
+palette2 <- c("#981FAC","#FF006A")
+
+# Path for the data
+data_path <- "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/Chapter6/housingSubsidy.csv"
+
+# Helper Function 
+
+## OSM data 
+
+get_amenity <- function(bbox, key, value, polygon){
+  am_osm_data <- opq(bbox = bbox) %>% 
+    add_osm_feature(key = key, value = value) %>%
+    osmdata_sf()
+  
+  points <- 
+    am_osm_data$osm_points %>%
+    .[polygon,] 
+  points
+}
+
+nn_function <- function(measureFrom,measureTo,k) {
+  measureFrom_Matrix <- as.matrix(measureFrom)
+  measureTo_Matrix <- as.matrix(measureTo)
+  nn <-   
+    get.knnx(measureTo, measureFrom, k)$nn.dist
+  output <-
+    as.data.frame(nn) %>%
+    rownames_to_column(var = "thisPoint") %>%
+    gather(points, point_distance, V1:ncol(.)) %>%
+    arrange(as.numeric(thisPoint)) %>%
+    group_by(thisPoint) %>%
+    summarize(pointDistance = mean(point_distance)) %>%
+    arrange(as.numeric(thisPoint)) %>% 
+    dplyr::select(-thisPoint) %>%
+    pull()
+  
+  return(output)  
+}
+
+
+get_n_nn <- function(df, points, n, var_name){
+  
+  for(i in 1:n){
+    col = paste0(var_name, "_n", i)
+    df[[col]] <- nn_function(st_coordinates(df), st_coordinates(points), i)
+  }
+  
+  df 
+}
+```
+
+# 3. Data 
+
+## 3.1 Data Gathering 
+
+#### Loading Our Dataset
+
+We first gather the necessary data, using the Socrata package for some data sets. We use health inspection data for year 2016 in Chicago to predict health inspection failures of food establishments in 2017. We also test the goodness of fit on the 2017 data. Additionally, we check the generalizability of the model across neighborhoods, race groups, and different kinds of establishments.
+
+We develop features to predict health inspection failure. Specifically, we considered 3 types of features which are described in the following sections
+
+- Census: Census data for features such as median income and education level, which we suspected would be impactful to our model.
+
+- 311 Calls: Reporting problems like abandoned cars/buildings, illegal postings, etc.
+
+- OSM (OpenStreetMap) Data: We used OSM data for average distances to nearest amenities, such as food amenities and ruined buildings.
+
+```{r,  message = FALSE, warning = FALSE}
+
+## pre-processing the data and load the RData because it takes a long time to download several datasets 
+
+load("~/Final_Musa.Rdata") 
+
+
+# df_2016 <- read.socrata("https://data.cityofchicago.org/resource/4ijn-s7e5.json") %>%
+#       mutate(inspection_year = year(inspection_date), 
+#              inspection_month = month(inspection_date), 
+#              inspection_quarter = quarter(inspection_date)) %>%
+#       filter(city == "CHICAGO" & inspection_year == 2016 & results %in% c("Fail", "Pass")) %>%
+#       dplyr::select(-c(violations,location.latitude,location.longitude,
+#                        inspection_date, address, city, state, zip)) %>%
+#       na.omit() %>% 
+#       st_as_sf(coords = c("longitude", "latitude"), crs = 4326, agr = "constant") %>%
+#    st_transform('ESRI:102271') 
+# 
+# 
+# df_2017 <- read.socrata("https://data.cityofchicago.org/resource/4ijn-s7e5.json") %>%
+#       mutate(inspection_year = year(inspection_date), 
+#              inspection_month = month(inspection_date), 
+#              inspection_quarter = quarter(inspection_date)) %>%
+#       filter(city == "CHICAGO" & inspection_year == 2017 & results %in% c("Fail", "Pass"))       %>% dplyr::select(-c(violations,location.latitude,location.longitude,
+#                        inspection_date, address, city, state, zip))  %>% na.omit() %>% 
+#       st_as_sf(coords = c("longitude", "latitude"), crs = 4326, agr = "constant") %>%
+#    st_transform('ESRI:102271') 
+# 
+# chicagoBoundary <- 
+#   st_read(file.path(root.dir,"/Chapter5/chicagoBoundary.geojson")) %>%
+#   st_transform('ESRI:102271') 
+
+```
+
+#### Plotting Point Form
+
+Both the point and the density plots show a clear hotspot for health inspection failure in the central/north side of Chicago, where there are more touristic food establishments compared to other parts of Chicago. 
+
+```{r, message = FALSE, warning = FALSE}
+
+df_2016_fail <- df_2016  %>% filter(results == "Fail") 
+
+grid.arrange(ncol=2,
+ggplot() + 
+  geom_sf(data = chicagoBoundary) +
+  geom_sf(data = df_2016_fail, colour="red", size=0.1, show.legend = "point") +
+  labs(title= "Health Inspection Failure - 2016") +
+  mapTheme(title_size = 14),
+
+ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "grey40") +
+  stat_density2d(data = data.frame(st_coordinates(df_2016_fail)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis() +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(title = "Density of Health Inspection Failure") +
+  mapTheme(title_size = 14) + theme(legend.position = "none"))
+```
+
+#### Census Data
+
+```{r, results='hide'}
+
+# census_api_key("85a7b9f09b041af3835517bba02cdb0918a803ca", overwrite = TRUE)
+# 
+# # Loading and cleaning tracts data for year 2016
+# # List of census vars
+# 
+# 
+# tracts16 <- 
+#   get_acs(geography = "tract",
+#           variables = c("B01001_001E", # ACS total Pop estimate
+#                         "B19013_001E", # Median HH Income ($)
+#                         "B02001_002E", # People describing themselves as "white alone"
+#                         "B24021_002E", # Total Management, Business, Science, and Arts Occupations            
+#                         "B25058_001E", # medrent 
+#                         "B06012_002E",  # Poverty  
+#                         "B06009_005E", # Total bachelors degree
+#                         "B06009_006E"), # Total graduate or professional degree
+#           year = 2016,
+#           state = "IL",
+#           county = "Cook County",
+#           geometry = TRUE,
+#           output = "wide") %>%
+#   st_transform('ESRI:102271') %>%
+#   dplyr::rename(TotalPop = B01001_001E,
+#          MedHHInc = B19013_001E,
+#          Whites = B02001_002E,
+#          TotalMBSA = B24021_002E,
+#          TotalBachDeg = B06009_005E,
+#          TotalGradDeg = B06009_006E, 
+#          TotalPoverty = B06012_002E,
+#          MedRent = B25058_001E ) %>%
+#   dplyr::select(-starts_with("B")) %>%
+#   filter(TotalPop > 0) %>%
+#   mutate(pctWhite = ifelse(TotalPop > 0, Whites / TotalPop, 0),
+#          pctMBSA = ifelse(TotalPop > 0,
+#                                round(100 * TotalMBSA / TotalPop, 2), 0),
+#          pctBachDeg = ifelse(TotalPop > 0,
+#                                round(100 * TotalBachDeg / TotalPop, 2), 0),
+#          pctGradDeg = ifelse(TotalPop > 0,
+#                              round(100 * TotalGradDeg / TotalPop, 2), 0)) %>%
+#   dplyr::select(-Whites) %>%  .[chicagoBoundary,]
+# 
+# 
+# tracts17 <- 
+#   get_acs(geography = "tract",
+#           variables = c("B01001_001E", # ACS total Pop estimate
+#                         "B19013_001E", # Median HH Income ($)
+#                         "B02001_002E", # People describing themselves as "white alone"
+#                         "B24021_002E", # Total Management, Business, Science, and Arts Occupations            
+#                         "B25058_001E", # medrent 
+#                         "B06012_002E",  # Poverty  
+#                         "B06009_005E", # Total bachelors degree
+#                         "B06009_006E"), # Total graduate or professional degree
+#           year = 2017,
+#           state = "IL",
+#           county = "Cook County",
+#           geometry = TRUE,
+#           output = "wide") %>%
+#   st_transform('ESRI:102271') %>%
+#   dplyr::rename(TotalPop = B01001_001E,
+#          MedHHInc = B19013_001E,
+#          Whites = B02001_002E,
+#          TotalMBSA = B24021_002E,
+#          TotalBachDeg = B06009_005E,
+#          TotalGradDeg = B06009_006E, 
+#          TotalPoverty = B06012_002E,
+#          MedRent = B25058_001E ) %>%
+#   dplyr::select(-starts_with("B")) %>%
+#   filter(TotalPop > 0) %>%
+#   mutate(pctWhite = ifelse(TotalPop > 0, Whites / TotalPop, 0),
+#          pctMBSA = ifelse(TotalPop > 0,
+#                                round(100 * TotalMBSA / TotalPop, 2), 0),
+#          pctBachDeg = ifelse(TotalPop > 0,
+#                                round(100 * TotalBachDeg / TotalPop, 2), 0),
+#          pctGradDeg = ifelse(TotalPop > 0,
+#                              round(100 * TotalGradDeg / TotalPop, 2), 0)) %>%
+#   dplyr::select(-Whites) %>%  .[chicagoBoundary,]
+
+
+```
+
+#### OSM Data
+
+```{r, message = FALSE, warning = FALSE}
+
+Cbound= chicagoBoundary %>% st_transform(crs=4326)
+
+# coordinate 
+xmin = st_bbox(Cbound)[[1]]
+ymin = st_bbox(Cbound)[[2]]
+xmax = st_bbox(Cbound)[[3]]  
+ymax = st_bbox(Cbound)[[4]]
+
+
+bbox <- c(xmin, ymin, xmax, ymax)
+studentDataPoly <- st_union(tracts16)
+
+# below code fixes SSL certificate error for Lance:
+
+# library(httr)
+# set_config(config(ssl_verifypeer = FALSE))
+# options(RCurlOptions = list(ssl_verifypeer = FALSE))
+# options(rsconnect.check.certificate = FALSE)
+
+
+# food amenity
+
+food_amenity <- opq(bbox = bbox) %>%
+     add_osm_feature(key = 'amenity', value = c("fast_food", "cafe", "restaurant")) %>%
+     osmdata_sf()
+
+food_amenity <-
+   food_amenity$osm_points %>%
+   .[Cbound,] %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+   mutate(Legend = "food_amenity")
+
+df_2016 <- get_n_nn(df_2016, food_amenity, 1, "food_places")
+df_2017 <- get_n_nn(df_2017, food_amenity, 1, "food_places")
+
+
+
+# nightlife amenity
+nightlife_amenity <- opq(bbox = bbox) %>%
+     add_osm_feature(key = 'amenity', value = c("bar", "nightclub")) %>%
+     osmdata_sf()
+
+nightlife_amenity <-
+   nightlife_amenity$osm_points %>%
+   .[Cbound,] %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+   mutate(Legend = "nightlife_amenity")
+
+df_2016 <- get_n_nn(df_2016, nightlife_amenity, 1, "nightlife_amenity")
+df_2017 <- get_n_nn(df_2017, nightlife_amenity, 1, "nightlife_amenity")
+
+
+
+# ruined building
+ruined_building <- opq(bbox = bbox) %>%
+     add_osm_feature(key = 'building', value = c("ruins")) %>%
+     osmdata_sf()
+
+ruined_building <-
+   ruined_building$osm_points %>%
+   .[Cbound,] %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+   mutate(Legend = "ruined_building")
+
+df_2016 <- get_n_nn(df_2016, ruined_building, 1, "ruined_building")
+df_2017 <- get_n_nn(df_2017, ruined_building, 1, "ruined_building")
+
+
+```
+
+#### City of Chicago Data
+
+```{r}
+
+risk_factor_ne <- function(data, legend_name) {
+   data %>% st_transform(crs=4326) %>% .[Cbound,] %>% st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+   mutate(Legend = legend_name) 
+  return(data) }
+
+
+abandonCars <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Abandoned-Vehicles/3c9v-pnva") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2016") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+    mutate(Legend = "abandoned_cars")
+
+
+abandonCars_2017 <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Abandoned-Vehicles/3c9v-pnva") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+    mutate(Legend = "abandoned_cars")
+
+
+
+abandonCars <- risk_factor_ne(abandonCars, 'abandoned_cars')
+df_2016 <- get_n_nn(df_2016, abandonCars, 1, "abandoned_cars")
+
+abandonCars_2017 <- risk_factor_ne(abandonCars_2017, 'abandoned_cars')
+df_2017 <- get_n_nn(df_2017, abandonCars_2017, 1, "abandoned_cars")
+
+
+
+abandonBuildings <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Vacant-and-Abandoned-Building/7nii-7srd") %>%
+    mutate(year = substr(date_service_request_was_received,1,4)) %>%  filter(year == "2016") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+    mutate(Legend = "abandoned_buildings")
+
+
+abandonBuildings_2017 <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Vacant-and-Abandoned-Building/7nii-7srd") %>%
+    mutate(year = substr(date_service_request_was_received,1,4)) %>%  filter(year == "2017") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+    mutate(Legend = "abandoned_buildings")
+
+abandonBuildings <- risk_factor_ne(abandonBuildings, 'abandoned_buildings')
+df_2016 <- get_n_nn(df_2016, abandonBuildings, 1, "abandoned_buildings")
+
+
+abandonBuildings_2017 <- risk_factor_ne(abandonBuildings_2017, 'abandoned_buildings')
+df_2017 <- get_n_nn(df_2017, abandonBuildings_2017, 1, "abandoned_buildings")
+
+
+
+
+streetLightsOut <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Street-Lights-All-Out/zuxi-7xem") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2016") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+    mutate(Legend = "street_lights_out")
+
+streetLightsOut_2017 <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Street-Lights-All-Out/zuxi-7xem") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+    mutate(Legend = "street_lights_out")
+
+streetLightsOut <- risk_factor_ne(streetLightsOut, 'street_lights_out')
+df_2016 <- get_n_nn(df_2016, streetLightsOut, 1, "street_lights_out")
+
+streetLightsOut_2017 <- risk_factor_ne(streetLightsOut_2017, 'street_lights_out')
+df_2017 <- get_n_nn(df_2017, streetLightsOut_2017, 1, "street_lights_out")
+
+
+
+graffiti <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Graffiti-Removal-Historical/hec5-y4x5") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2016") %>%
+    filter(where_is_the_graffiti_located_ %in% c("Front", "Rear", "Side")) %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+    mutate(Legend = "graffiti")
+
+graffiti_2017 <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Graffiti-Removal-Historical/hec5-y4x5") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+    filter(where_is_the_graffiti_located_ %in% c("Front", "Rear", "Side")) %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+    mutate(Legend = "graffiti")
+
+
+graffiti <- risk_factor_ne(graffiti, 'graffiti')
+df_2016 <- get_n_nn(df_2016, graffiti, 1, "graffiti")
+
+graffiti_2017 <- risk_factor_ne(graffiti_2017, 'graffiti')
+df_2017 <- get_n_nn(df_2017, graffiti_2017, 1, "graffiti")
+
+
+
+sanitation <-
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Sanitation-Code-Complaints-Hi/me59-5fac") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2016") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+    mutate(Legend = "sanitation")
+
+
+sanitation_2017 <-
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Sanitation-Code-Complaints-Hi/me59-5fac") %>%
+    mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs('ESRI:102271')) %>%
+    mutate(Legend = "sanitation")
+
+sanitation <- risk_factor_ne(sanitation, 'sanitation')
+df_2016 <- get_n_nn(df_2016, sanitation, 1, "sanitation")
+
+sanitation_2017 <- risk_factor_ne(sanitation_2017, 'sanitation')
+df_2017 <- get_n_nn(df_2017, sanitation_2017, 1, "sanitation")
+
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+## making top 9 list for facility type 
+top9_est = table(df_2016$facility_type) %>% 
+        as.data.frame() %>% 
+        arrange(desc(Freq)) %>% head(9) 
+
+
+final <- df_2016 %>%  st_join(tracts16)  %>%
+           mutate(results = ifelse(df_2016$results == "Fail", 1, 0)) %>% 
+           mutate(facility_type = ifelse(facility_type %in% top9_est$Var1, facility_type, "Others" )) %>%
+        dplyr::select(-inspection_id, - dba_name, -aka_name, -license_ , -NAME, -inspection_type, -GEOID) %>% na.omit()
+
+
+final_2017 <- df_2017 %>%  st_join(tracts17)  %>%
+           mutate(results = ifelse(df_2017$results == "Fail", 1, 0)) %>% 
+           mutate(facility_type = ifelse(facility_type %in% top9_est$Var1, facility_type, "Others" )) %>%
+        dplyr::select(-inspection_id, - dba_name, -aka_name, -license_ , -NAME, -inspection_type, -GEOID) %>% na.omit()
+
+
+```
+
+## 3.2 Exploratory Data Analysis 
+
+#### Risk Factor Descriptive Analysis
+
+We present the summary statistics of some risk features, which we later engineer. 
+
+```{r, message = FALSE, warning = FALSE}
+stargazer(st_drop_geometry(final)%>% dplyr::select("ruined_building_n1","abandoned_cars_n1","abandoned_buildings_n1","street_lights_out_n1", "graffiti_n1", "sanitation_n1"), type = "text",
+          title="Descriptive statistics- Risk Factors Characteristics", digits=1,median=TRUE,iqr=FALSE,
+          covariate.labels=c("Dist to nearest ruined building", " Dist to nearest abandoned car report", " Dist to nearest abandoned building report","Dist to nearest street light out report", "Dist to nearest graffiti report", "Dist to nearest sanitation report" ))
+```
+
+#### Mean Barplot for Continuous Variables
+
+From the plot below, we can see that there is a difference in mean values between the two groups (Fail vs. Pass) for features, such as nearest abandoned building and total poverty. 
+
+- Food establishments were more likely to fail health inspection if they were located in a higher total poverty area, 
+
+- Food establishments were more likely to fail health inspection if they were located closer to abandoned buildings.
+
+```{r, message = FALSE, warning = FALSE}
+
+st_drop_geometry(final)  %>%
+  mutate(results_f = ifelse(results == 1, "Fail", "Pass")) %>% 
+  dplyr::select(results_f, food_places_n1,  nightlife_amenity_n1, ruined_building_n1,                 abandoned_cars_n1, abandoned_buildings_n1, street_lights_out_n1, TotalPoverty,MedRent,                  graffiti_n1, sanitation_n1, MedHHInc, pctWhite,pctMBSA, pctBachDeg, pctGradDeg) %>%
+         gather(Variable, value, -results_f) %>%
+         ggplot(aes(results_f, value, fill=results_f)) + 
+      geom_bar(position = "dodge", stat = "summary", fun.y = "mean") + 
+      facet_wrap(~Variable, scales = "free") +
+      scale_fill_manual(values = palette2) +
+      labs(x="results", y="Value", 
+           title = "Feature associations with the likelihood of failing health inspection",
+           subtitle = "(continous outcomes)") +
+      theme(legend.position = "none")
+```
+ 
+#### Density Plot for Continuous Variables
+
+From the density plot, we can compare between the distribution of continuous features for food establishments where they passed health inspection and the distribution of continuous features for food establishments where they failed health inspection. Some observations include:
+
+We can see that all of the features are not normally distributed.
+For some features, such as total poverty and nearest distance to ruined buildings, the differences in mean values between two groups (pass vs. fail) are not great. However, segmentation by group will make the difference between the two groups bigger.
+
+```{r,  message = FALSE, warning = FALSE}
+
+st_drop_geometry(final) %>%
+  mutate(results_f = ifelse(results == 1, "Fail", "Pass")) %>% 
+  dplyr::select(results_f, food_places_n1,  nightlife_amenity_n1, ruined_building_n1,                 abandoned_cars_n1, abandoned_buildings_n1, street_lights_out_n1,TotalPoverty,MedRent,                     graffiti_n1, sanitation_n1, MedHHInc, pctWhite,pctMBSA, pctBachDeg, pctGradDeg) %>%
+    gather(Variable, value, -results_f) %>%
+    ggplot() + 
+    geom_density(aes(value, color=results_f), fill = "transparent") + 
+    facet_wrap(~Variable, scales = "free") +
+    scale_fill_manual(values = palette2) +
+    labs(title = "Feature distributions pass inspection vs. fail inspection",
+         subtitle = "(continous outcomes)")
+```
+
+#### Barplot for the target variable 
+ 
+From the graph below, we can see that our target variable is imbalanced (75% Pass, 25% Fail), which makes it more challenging to build a model to predict failure. 
+
+```{r,  message = FALSE, warning = FALSE}
+
+st_drop_geometry(final) %>%
+    mutate(results_f = ifelse(results == 1, "Fail", "Pass")) %>% 
+  dplyr::select(results_f) %>%
+    gather(Variable, value) %>%
+    count(Variable, value) %>%
+      ggplot(., aes(value, n, fill = value)) +   
+        geom_bar(position = "dodge", stat="identity") +
+        facet_wrap(~Variable, scales="free") +
+        scale_fill_manual(values = palette2) +
+        labs(x="Health Inspection", y="Value",
+             title = "Feature associations with the likelihood of failing health inspection",
+             subtitle = "Target features") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+```
+
+#### Mean Barplot for Categorical Variables
+
+From the below plot we can compare between mean values of categorical features for two groups. Some observations include:
+
+- Most categorical features did not show significant difference in mean values between the two groups (Pass vs. Fail).
+
+```{r,  message = FALSE, warning = FALSE}
+
+st_drop_geometry(final) %>%
+    mutate(results_f = ifelse(results == 1, "Fail", "Pass")) %>% 
+  dplyr::select(results_f, risk,  inspection_month, inspection_quarter) %>%
+    gather(Variable, value, -results_f) %>%
+    count(Variable, value, results_f) %>%
+      ggplot(., aes(value, n, fill = results_f)) +   
+        geom_bar(position = "dodge", stat="identity") +
+        facet_wrap(~Variable, scales="free") +
+        scale_fill_manual(values = palette2) +
+        labs(x="credit", y="Value",
+             title = "Feature associations with the likelihood of failing health inspection",
+             subtitle = "Categorical features") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+# 4. Create A Logistic Regression Model
+
+From the previous section, we learn about important features that differentiate characteristics of food establishments where they passed food inspection versus food establishments where they did not pass food inspection. With the learning points from EDA section, we are going to build a logistic regression model that predicts a binary outcome - a `1` or a `0` - a `fail` or a `pass` and associates a coefficient that describes the change in the probability of the outcome given some change in the independent variable.
+
+We partition our data into a 65/35 training and test set (`p = 0.65`). We call these sets `Train` and `Test`.
+
+```{r,  message = FALSE, warning = FALSE}
+
+set.seed(3456)
+trainIndex <- createDataPartition(final$results, p = .65,
+                                  list = FALSE,
+                                  times = 1)
+
+Train <- final[ trainIndex,]
+Test  <- final[-trainIndex,]
+```
+
+## 4.1 Kitchen Sink Model
+
+First, we build a model with all the features we have. This model gives a McFadden R-Squared value of 0.012 and a Sensitivity (True Positive Rate) of 0.19 on the test set if using a threshold of 0.3. Out of all the food establishments who were likely to fail health inspection, our model is able to select 19% of them.
+
+```{r}
+
+# Building the model
+reg_1 <- glm(results ~ .,
+                  data= st_drop_geometry(Train),
+                  family="binomial" (link="logit"))
+
+# Predictions on test set
+testProbs <- data.frame(Outcome = as.factor(Test$results),
+                        Probs = predict(reg_1, Test, type= "response"))
+
+# Thresholding 
+testProbs <- 
+  testProbs %>%
+  mutate(predOutcome  = as.factor(ifelse(testProbs$Probs > 0.3 , 1, 0)))
+
+# Confusion matrix
+conf_mat <- caret::confusionMatrix(testProbs$predOutcome, testProbs$Outcome, 
+                       positive = "1")
+pR2(reg_1)[4]
+
+conf_mat$byClass['Sensitivity']
+
+
+```
+
+## 4.2 Feature Engineered Model
+
+The previous model with all features has a low sensitivity. In this section, we are going to perform feature engineering to create features that might be helpful to improve sensitivity. From the findings in the EDA section, we bucket a number of the continuous features (total poverty, nearest food amenity, nearest ruined building) such that the bucketing helps to capture the difference between two groups (Pass vs. Fail). We remove some variables which do not exhibit much difference between the two groups.
+
+```{r}
+
+feature_eng <- function(df){
+  
+  df_eng <- df %>% 
+    mutate(TotalPoverty = case_when(
+      TotalPoverty < 647 ~ 'group1',
+      TotalPoverty >= 647 &  TotalPoverty < 1000 ~ 'group2',
+      TotalPoverty >= 1000 &  TotalPoverty < 1500 ~ 'group3',
+      TotalPoverty >= 1500 ~ 'group4')) %>% 
+    mutate(food_places_n1 = case_when(
+      food_places_n1 < 10 ~ 'group1',
+      food_places_n1 >= 10 &  food_places_n1 < 50 ~ 'group2',
+      food_places_n1 >= 50 &  food_places_n1 < 90 ~ 'group3',
+      food_places_n1 >= 90 ~ 'group4')) %>%
+     mutate(sanitation_n1 = case_when(
+      sanitation_n1 < 10 ~ 'group1',
+      sanitation_n1 >= 10 &  sanitation_n1 < 50 ~ 'group2',
+       sanitation_n1 >= 50 &  sanitation_n1 < 90 ~ 'group3',
+       sanitation_n1 >= 90 ~ 'group4')) %>% 
+      mutate(ruined_building_n1 = case_when(
+      ruined_building_n1 < 5000 ~ 'group1',
+      ruined_building_n1 >= 5000 &  ruined_building_n1 < 9000 ~ 'group2',
+       ruined_building_n1 >= 9000 &  ruined_building_n1 < 15000 ~ 'group3',
+       ruined_building_n1 >= 15000 ~ 'group4')) %>%
+      mutate(MedHHInc = case_when(
+      MedHHInc < 40000 ~ 'group1',
+      MedHHInc >= 40000 &  MedHHInc < 60000 ~ 'group2',
+       MedHHInc >= 60000 &  MedHHInc < 90000 ~ 'group3',
+       MedHHInc >= 90000 ~ 'group4')) %>%
+    
+    
+    dplyr::select( -inspection_year, -inspection_month, -pctGradDeg, -TotalMBSA,-street_lights_out_n1 ,-graffiti_n1, -pctWhite, -pctMBSA, -TotalBachDeg, -TotalGradDeg, -risk)
+  
+  df_eng 
+}
+
+
+Train_new <- feature_eng(Train)
+Test_new <- feature_eng(Test)
+
+
+
+# Building the model
+reg_new <- glm(results ~ .,
+                  data= st_drop_geometry(Train_new),
+                  family="binomial" (link="logit"))
+
+# Predictions on test set
+testProbs_new <- data.frame(Outcome = as.factor(Test_new$results),
+                        Probs = predict(reg_new, Test_new, type= "response"))
+
+# Thresholding 
+testProbs_new <- 
+  testProbs_new %>%
+  mutate(predOutcome  = as.factor(ifelse(testProbs_new$Probs > 0.3 , 1, 0)))
+
+# Confusion matrix
+conf_mat_new <- caret::confusionMatrix(testProbs_new$predOutcome, testProbs_new$Outcome, 
+                       positive = "1")
+pR2(reg_new)[4]
+
+conf_mat_new$byClass['Sensitivity']
+
+```
+
+The new engineered model gives a McFadden R-squared value of 0.015 and a Sensitivity (True Positive Rate) of 0.24 on the test set (using 0.3), which is approximately 26% improvement in absolute percent terms. Although the new engineered model has better results, 24% true positive rate is not optimal.
+
+Following we show a regression summary for both the kitchen sink and engineered model
+
+```{r}
+stargazer(reg_1, reg_new, type = "text",
+          align=TRUE,
+          no.space = TRUE,
+          single.row = TRUE,
+          column.labels=c("Kitchen Sink Model","Engineered Model"))
+```
+
+## 4.3 Cross Validation
+
+We run 100-fold cross validation and look at the ROC (aka AUC), Sensitivity and Specificity across this series of predicitons.
+From the below plots, we can see that the kitchen sink model is very good at predicting food establishments where would pass health inspection (True Negative Rate), but it is not good at generalizing for food establishments where they would fail health inspection (True Positive Rate).
+
+```{r, message = FALSE, warning = FALSE}
+## Kitchen Sink model 
+
+Train_f = st_drop_geometry(Train) %>%
+    mutate(results_f = ifelse(results == 1, "Fail", "Pass"))
+
+ctrl <- trainControl(method = "cv", number = 100, classProbs= 0.3, summaryFunction=twoClassSummary)
+
+cvFit <- train(results_f ~ .,
+                  data=Train_f%>% 
+                    dplyr::select(-results),
+                method="glm", family="binomial",
+                metric="ROC", trControl = ctrl)
+
+
+dplyr::select(cvFit$resample, -Resample) %>%
+  gather(metric, value) %>%
+  left_join(gather(cvFit$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+    geom_histogram(bins=35, fill = "#FF006A") +
+    facet_wrap(~metric) +
+    geom_vline(aes(xintercept = mean), colour = "#981FAC", linetype = 3, size = 1.5) +
+    labs(x="Goodness of Fit", y="Count", title="CV Goodness of Fit Metrics",
+         subtitle = "Across-fold mean reprented as dotted lines")
+
+
+```
+
+The engineered model shows a similar pattern to the kitchen sink model - we can see that the engineered model is very good at predicting food establishments that would pass health inspection (True Negative Rate), but it is not good at generalizing for food establishments where they would fail health inspection (True Positive Rate).
+
+```{r, message = FALSE, warning = FALSE}
+
+## Engineered Model 
+
+
+Train_f_new = st_drop_geometry(Train_new) %>%
+    mutate(results_f = ifelse(results == 1, "Fail", "Pass"))
+
+ctrl <- trainControl(method = "cv", number = 100, classProbs= 0.3, summaryFunction=twoClassSummary)
+
+cvFit <- train(results_f ~ .,
+                  data=Train_f_new%>% 
+                    dplyr::select(-results),
+                method="glm", family="binomial",
+                metric="ROC", trControl = ctrl)
+
+
+dplyr::select(cvFit$resample, -Resample) %>%
+  gather(metric, value) %>%
+  left_join(gather(cvFit$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+    geom_histogram(bins=35, fill = "#FF006A") +
+    facet_wrap(~metric) +
+    geom_vline(aes(xintercept = mean), colour = "#981FAC", linetype = 3, size = 1.5) +
+    labs(x="Goodness of Fit", y="Count", title="CV Goodness of Fit Metrics",
+         subtitle = "Across-fold mean reprented as dotted lines")
+```
+
+## 4.4 ROC Curve
+
+The ROC curve shows the trade off between True Positive Rate (food establishments where they would fail health inspection) and False Positive Rate (food establishments that the model identify that they would fail health inspection but did not fail health inspection), and allows us to choose the appropriate threshold for the model based on the cost/benefit associated with this tradeoff. The ROC curves gives an AUC (Area Under Curve) value of 0.58, which indicates that the engineered model might still be a slightly useful fit and does better than just random selection of food establishments for health inspection. 
+
+```{r}
+ggplot(testProbs_new, aes(d = as.numeric(Outcome), m = Probs)) +
+  geom_roc(n.cuts = 50, labels = FALSE, colour = "#FE9900") +
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') +
+  labs(title = "ROC Curve - Engineered Model") + 
+  plotTheme()
+```
+
+```{r}
+pROC::auc(testProbs_new$Outcome, testProbs_new$Probs)
+
+```
+
+```{r}
+ggplot(testProbs, aes(d = as.numeric(Outcome), m = Probs)) +
+  geom_roc(n.cuts = 50, labels = FALSE, colour = "#FE9900") +
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') +
+  labs(title = "ROC Curve -  Kitchen Sink Model") + 
+  plotTheme()
+```
+
+```{r}
+pROC::auc(testProbs$Outcome, testProbs$Probs)
+
+```
+
+## 4.5 Predicting 2017 Health Inspection Results 
+
+The new engineered model gives a McFadden R-squared value of 0.015 and a Sensitivity (True Positive Rate) of 0.17 on 2017 health inspection data (using 0.3). The below maps compare the actual hotspot of the health inspection failure and the health inspection failure category map by our prediction model. We can see that our model is not able to capture geospatial features that might boost the health inspection prediction power.
+
+```{r}
+final_2017_df <- feature_eng(final_2017)
+
+# Predictions on 2017
+testProbs_2017 <- data.frame(Outcome = as.factor(final_2017_df$results),
+                        Probs = predict(reg_new, final_2017_df, type= "response"))
+
+testProbs_2017_per <- final_2017_df %>%  mutate(label = "Predictions",
+         Fail_Category = ntile(testProbs_2017$Probs, 100),
+         Fail_Category = case_when(
+           Fail_Category >= 90 ~ "90% to 100%",
+           Fail_Category >= 70 & Fail_Category <= 89 ~ "70% to 89%",
+           Fail_Category >= 50 & Fail_Category <= 69 ~ "50% to 69%",
+           Fail_Category >= 30 & Fail_Category <= 49 ~ "30% to 49%",
+           Fail_Category >= 1 & Fail_Category <= 29 ~ "1% to 29%")) 
+
+
+# Thresholding 
+testProbs_2017 <- 
+  testProbs_2017 %>%
+  mutate(predOutcome  = as.factor(ifelse(testProbs_2017$Probs > 0.3 , 1, 0)))
+
+# Confusion matrix
+conf_mat_new <- caret::confusionMatrix(testProbs_2017$predOutcome, testProbs_2017$Outcome, 
+                       positive = "1")
+pR2(reg_new)[4]
+
+conf_mat_new$byClass['Sensitivity']
+```
+
+```{r}
+df_2017_fail <- df_2017  %>% filter(results == "Fail") 
+
+grid.arrange(ncol=2,
+ggplot() + 
+  geom_sf(data = chicagoBoundary) +
+  geom_sf(data = df_2017_fail, colour="red", size=0.1, show.legend = "point") +
+  labs(title= "Health Inspection Failure - 2017") +
+  mapTheme(title_size = 14),
+
+ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "grey40") +
+  stat_density2d(data = data.frame(st_coordinates(df_2017_fail)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis() +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(title = "Density of Health Inspection Failure") +
+  mapTheme(title_size = 14) + theme(legend.position = "none"))
+
+```
+
+```{r}
+
+testProbs_2017_per %>%   gather(Variable, Value, -label, -Fail_Category, -geometry) %>%  ggplot() +
+    geom_sf(data = chicagoBoundary) +
+    geom_sf(aes(fill = Fail_Category, color =Fail_Category)) +
+    scale_fill_viridis(discrete = TRUE) +
+    labs(title="Inspection Failure Predictions",
+         subtitle="2017 Health Inspection Data") +
+    mapTheme()
+```
+
+## 4.6 Generalizability of Model 
+
+#### By Facility Type 
+
+We check the generalizability of the model across different kinds of establishments. We can see that our model performance across types of establishments are different. It performs better on long term care and bakery than day care places. One of the reasons that day care places have very bad model performances is that there are not many day care places in our dataset (less than 1%).    
+
+```{r}
+
+cbind(testProbs_2017,testProbs_2017_per$facility_type) %>% group_by(testProbs_2017_per$facility_type) %>% summarise(accuracy = sum(Outcome == predOutcome) / n(), sensitivity = sensitivity(predOutcome, Outcome , positive="1")) %>% kable() %>% 
+  kable_styling(font_size = 12, full_width = F,
+                bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+#### By Income Context 
+
+We check the generalizability of the model across different income level contexts (areas above 50% of median income vs. areas below 50% of median income). The below plot shows some income segregation in Chicago.
+
+```{r}
+gen_2017_df <- 
+  tracts17 %>%
+  mutate(incomeContext = ifelse(MedHHInc > 59274, "High Income", "Low Income"), 
+          raceContext = ifelse(pctWhite > .5, "Majority White", "Majority Non-White"))
+
+
+ggplot() +
+  geom_sf(data = na.omit(gen_2017_df),
+          aes(fill = incomeContext)) +
+    scale_fill_manual(values = c("#25CB10", "#FA7800"),
+                      name = "Income Context") +
+    labs(title = "Cook County Census Tracts by Median Household Income") +
+    mapTheme() + theme(legend.position="bottom")
+
+```
+
+The below table shows sensitivity from 2017 health inspection data. We can see that low income area has 10 percent higher sensitivity than high income area, indicating that our model works better on low income area. 
+
+```{r}
+
+context_df <- 
+  final_2017 %>%
+  mutate(incomeContext = ifelse(MedHHInc > 59274, "High Income", "Low Income"), 
+          raceContext = ifelse(pctWhite > .5, "Majority White", "Majority Non-White"))
+
+
+
+cbind(testProbs_2017, context_df$incomeContext) %>% group_by(context_df$incomeContext) %>% summarise(accuracy = sum(Outcome == predOutcome) / n(), sensitivity = sensitivity(predOutcome, Outcome, positive="1")) %>% kable() %>% 
+  kable_styling(font_size = 12, full_width = F,
+                bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+#### Race Context
+
+We check the generalization of the model across different race contexts (majority white and majority non-white). The below plot shows some racial segregation in Chicago.
+
+```{r}
+ggplot() +
+  geom_sf(data = na.omit(gen_2017_df),
+          aes(fill = raceContext)) +
+    scale_fill_manual(values = c("#25CB10", "#FA7800"),
+                      name = "Race Context") +
+    labs(title = "Cook County Census Tracts by Majority White Percent") +
+    mapTheme() + theme(legend.position="bottom")
+```
+
+Below table shows sensitivity from 2017 health inspection data. We can see that majority non white area has 10 percent higher sensitivity than majority white area, indicating that our model works better on majority non white area. 
+
+```{r}
+cbind(testProbs_2017, context_df$raceContext) %>% group_by(context_df$raceContext) %>% summarise(accuracy = sum(Outcome == predOutcome) / n(), sensitivity = sensitivity(predOutcome, Outcome, positive="1")) %>% kable() %>% 
+  kable_styling(font_size = 12, full_width = F,
+                bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# 5. Cost Benefit Analysis
+
+A cost benefit analysis is conducted to examine the economic impacts of our product.
+
+For the purposes of this analysis, we assume that health inspector wages and inspection operating costs are "sunk costs" which are not impacted by our model. Additionally, we assume that there is a set limited number of inspections that will be performed. Our algorithm will guide the allocation of these limited inspections. For every establishment that is inspected as a result of our predictions, a different establishment will not be inspected.
+
+Food establishments are currently inspected at various recurring intervals, including an annual inspection, as well as in response to complaints (City of Chicago). By predicting inspection failures, the Health Department can allocate its limited resources to prioritize inspecting food establishments that are predicted to fail inspection. Health violations will be observed at an earlier point in time as a result, which will increase food safety compliance throughout the city.
+
+It is difficult to place dollar values on the costs and benefits associated with catching violations earlier. We use the example of norovirus, the most common source of foodborne illness in the United States (United States Food and Drug Administration), to demonstrate the potential impacts. We conservatively estimate that the average cost of not catching a health violation earlier will equate to the cost associated with a single symptomatic case of norovirus, which is estimated to be $464 (Bartsch SM, O'Shea KJ, Lee BY). This does not account for all other sources of foodborne illness, the potential for norovirus to spread among people, and the many other economic costs of decreased food safety.
+
+The confusion matrix outcomes and the net revenue for each outcome are outlined below:
+
+<style>
+ol ul {
+    margin-bottom: 10px;
+}
+</style>
+
+1. True Positive - Predicted correctly establishment would fail inspection. Health inspectors prioritize inspecting this establishment instead of another.
+    + Net revenue = Economic benefit of catching violation earlier
+    + $464
+
+2. True Negative - Predicted correctly establishment would not fail inspection. Health inspectors do not prioritize inspecting this establishment instead of another.
+    + Net revenue = 0
+
+3. False Positive - Predicted incorrectly establishment would fail inspection. Health inspectors prioritize inspecting this establishment instead of another.
+    + Net revenue = Cost of not catching violation earlier
+    + -$464
+
+4. False Negative - Predicted incorrectly establishment would not fail inspection. Health inspectors do not prioritize inspecting this establishment instead of another.
+    + Net revenue = Cost of not catching violation earlier
+    + -$464
+
+The below tables show cost/benefit outcomes for both our model's predictions and random 50/50 predictions of inspection failure. While revenue is lost due to health code violations in either prediction setting, we observe that less revenue is lost when our model's predictions are used than when inspections are allocated randomly.
+
+```{r cost_benefit}
+
+cost_benefit_table <-
+   testProbs_2017 %>%
+      count(predOutcome, Outcome) %>%
+      summarize(True_Positive = sum(n[predOutcome==1 & Outcome==1]),
+                True_Negative = sum(n[predOutcome==0 & Outcome==0]),
+                False_Positive = sum(n[predOutcome==1 & Outcome==0]),
+                False_Negative = sum(n[predOutcome==0 & Outcome==1])) %>%
+       gather(Variable, Count) %>%
+       mutate(Revenue =
+               case_when(Variable == "True_Positive"  ~ Count * 464,
+                         Variable == "True_Negative"  ~ 0,
+                         Variable == "False_Positive" ~ Count * -464,
+                         Variable == "False_Negative" ~ Count * -464)) %>%
+    bind_cols(data.frame(Description = c(
+              "Predicted correctly establishment would fail inspection. Health inspectors prioritize inspecting this establishment instead of another.",
+              "Predicted correctly establishment would not fail inspection. Health inspectors do not prioritize inspecting this establishment instead of another.",
+              "Predicted incorrectly establishment would fail inspection. Health inspectors prioritize inspecting this establishment instead of another.",
+              "Predicted incorrectly establishment would not fail inspection. Health inspectors do not prioritize inspecting this establishment instead of another."))) %>%
+    bind_rows(summarise(.,
+                      across(where(is.numeric), sum),
+                      across(Variable, ~ "Total"),
+                      across(Description, ~ "")))
+
+kable(cost_benefit_table,
+       caption = "Table 1: Cost/Benefit for Predictive Model") %>% kable_styling()
+
+cost_benefit_table_random <-
+   testProbs_2017 %>%
+      # add column with random 50/50 predictions
+      mutate(rand_pred = rbinom(n = nrow(.), size = 1, prob = 0.5)) %>%
+      count(rand_pred, Outcome) %>%
+      summarize(True_Positive = sum(n[rand_pred==1 & Outcome==1]),
+                True_Negative = sum(n[rand_pred==0 & Outcome==0]),
+                False_Positive = sum(n[rand_pred==1 & Outcome==0]),
+                False_Negative = sum(n[rand_pred==0 & Outcome==1])) %>%
+       gather(Variable, Count) %>%
+       mutate(Revenue =
+               case_when(Variable == "True_Positive"  ~ Count * 464,
+                         Variable == "True_Negative"  ~ 0,
+                         Variable == "False_Positive" ~ Count * -464,
+                         Variable == "False_Negative" ~ Count * -464)) %>%
+    bind_cols(data.frame(Description = c(
+              "Predicted correctly establishment would fail inspection. Health inspectors prioritize inspecting this establishment instead of another.",
+              "Predicted correctly establishment would not fail inspection. Health inspectors do not prioritize inspecting this establishment instead of another.",
+              "Predicted incorrectly establishment would fail inspection. Health inspectors prioritize inspecting this establishment instead of another.",
+              "Predicted incorrectly establishment would not fail inspection. Health inspectors do not prioritize inspecting this establishment instead of another."))) %>%
+    bind_rows(summarise(.,
+                      across(where(is.numeric), sum),
+                      across(Variable, ~ "Total"),
+                      across(Description, ~ "")))
+
+kable(cost_benefit_table_random,
+       caption = "Table 2: Cost/Benefit for Random 50/50 Predictions") %>% kable_styling()
+
+```
+
+In this section, we are looking for a a threshold, which gives a better cost/benefit. Below plot shows how the profit generated by the different confusion metrics vary as we vary the model threshold from 0 to 1. We observe large changes in the distribution of confusion matrix categories as well as in associated revenue as the threshold shifts around the range of 0.25. This threshold range is similar to the overall inspection fail rate for our data.
+
+```{r}
+
+iterateThresholds <- function(data, observedClass, predictedProbs, group) {
+  observedClass <- enquo(observedClass)
+  predictedProbs <- enquo(predictedProbs)
+  group <- enquo(group)
+  x = .01
+  all_prediction <- data.frame()
+  
+  if (missing(group)) {
+  
+    while (x <= 1) {
+    this_prediction <- data.frame()
+    
+    this_prediction <-
+      data %>%
+      mutate(predclass = ifelse(!!predictedProbs > x, 1,0)) %>%
+      count(predclass, !!observedClass) %>%
+      summarize(Count_TN = sum(n[predclass==0 & !!observedClass==0]),
+                Count_TP = sum(n[predclass==1 & !!observedClass==1]),
+                Count_FN = sum(n[predclass==0 & !!observedClass==1]),
+                Count_FP = sum(n[predclass==1 & !!observedClass==0]),
+                Rate_TP = Count_TP / (Count_TP + Count_FN),
+                Rate_FP = Count_FP / (Count_FP + Count_TN),
+                Rate_FN = Count_FN / (Count_FN + Count_TP),
+                Rate_TN = Count_TN / (Count_TN + Count_FP),
+                Accuracy = (Count_TP + Count_TN) / 
+                           (Count_TP + Count_TN + Count_FN + Count_FP)) %>%
+      mutate(Threshold = round(x,2))
+    
+    all_prediction <- rbind(all_prediction,this_prediction)
+    x <- x + .01
+  }
+  return(all_prediction)
+  }
+  else if (!missing(group)) { 
+   while (x <= 1) {
+    this_prediction <- data.frame()
+    
+    this_prediction <-
+      data %>%
+      mutate(predclass = ifelse(!!predictedProbs > x, 1,0)) %>%
+      group_by(!!group) %>%
+      count(predclass, !!observedClass) %>%
+      summarize(Count_TN = sum(n[predclass==0 & !!observedClass==0]),
+                Count_TP = sum(n[predclass==1 & !!observedClass==1]),
+                Count_FN = sum(n[predclass==0 & !!observedClass==1]),
+                Count_FP = sum(n[predclass==1 & !!observedClass==0]),
+                Rate_TP = Count_TP / (Count_TP + Count_FN),
+                Rate_FP = Count_FP / (Count_FP + Count_TN),
+                Rate_FN = Count_FN / (Count_FN + Count_TP),
+                Rate_TN = Count_TN / (Count_TN + Count_FP),
+                Accuracy = (Count_TP + Count_TN) / 
+                           (Count_TP + Count_TN + Count_FN + Count_FP)) %>%
+      mutate(Threshold = round(x,2))
+    
+    all_prediction <- rbind(all_prediction,this_prediction)
+    x <- x + .01
+  }
+  return(all_prediction)
+  }
+}
+
+# Iterating through thresholds and getting confusion metrics
+whichThreshold <- 
+  iterateThresholds(
+     data=testProbs_2017, observedClass = Outcome, predictedProbs = Probs)
+
+# Calculating revenue associated with each confusion metric
+whichThreshold <- 
+  whichThreshold %>%
+    dplyr::select(starts_with("Count"), Threshold) %>%
+    gather(Variable, Count, -Threshold) %>%
+    mutate(Revenue =
+                 case_when(Variable == "Count_TN"  ~ 0,
+                           Variable == "Count_TP"  ~ Count * 464 ,
+                           Variable == "Count_FN"  ~ Count * -464,
+                           Variable == "Count_FP"  ~ Count * -464)
+    )
+
+# Plotting
+whichThreshold %>%
+  ggplot(.,aes(Threshold, Revenue, colour = Variable)) +
+  geom_point() +
+  scale_colour_manual(values = palette5[c(5, 1:3)]) +    
+  labs(title = "Profit by confusion matrix type and threshold",
+       y = "Profit") +
+  plotTheme() +
+  guides(colour=guide_legend(title = "Confusion Matrix")) 
+
+
+```
+
+As we increase the threshold of our model, our model becomes stricter in predicting health inspection failure. Also, many of the actual health inspection failures do not have high predicted probability of failure from our model because we see that total count failure becomes 0 beyond the threshold of 0.5.
+
+```{r}
+
+# Calculating Total Revenue and Failure
+whichThreshold_revenue <- 
+  whichThreshold %>% 
+    mutate(Failure = ifelse(Variable == "Count_TP", Count , 
+                            ifelse(Variable == "Count_FN", 0, 0))) %>% 
+    group_by(Threshold) %>% 
+    summarize(Total_Revenue = sum(Revenue),
+              Total_Count_Failure = round(sum(Failure))
+              ) 
+# Plotting
+whichThreshold_revenue %>%
+  dplyr::select(Threshold, Total_Revenue, Total_Count_Failure) %>%
+  gather(Variable, Value, -Threshold) %>%
+  ggplot(aes(Threshold, Value) ) +
+  geom_point(color=palette2[2]) +
+  geom_vline(xintercept = pull(arrange(whichThreshold_revenue, -Total_Revenue)[1,1])) + 
+  facet_wrap(~Variable, scales = "free")+
+  plotTheme() +
+  labs(title = "Threshold as a function of Revenue and Health Inspection Failure",
+       subtitle = "Total count failure are rounded to nearest interger value")
+```
+
+```{r}
+selected_threshold <- arrange(whichThreshold_revenue, -Total_Revenue)[1,1]
+
+# Comparing optimal and 30% threshold
+whichThreshold_revenue %>% 
+  filter(Threshold %in% c(0.3, selected_threshold)) %>% 
+  mutate(Threshold = ifelse(Threshold == 0.3, "30% Threshold", "Optimal_Threshold")) %>% 
+  kable() %>% 
+  kable_styling(font_size = 12, full_width = F,
+                bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+# 6. Conclusion
+
+From our analysis, we learned that our feature engineered model performs with the performance (0.24 True positive rate with a threshold of 0.3, 0.58 AUC), which might still be a slightly useful fit and does better than just random selection of food establishments for health inspection. Some of the more important features of the model were variables relating to the proximity to amenities and ruined buildings. 
+We can observe that our health inspection model needs to make more improvement on generalization across different types of food establishments, different racial groups, and different income level neighborhoods. It might be possible that our model fails to generalize differnt demographic groups (income, educaiton). Unobserved selection bias, if it exists in the model, might result in prediction of high health inspection failure risk in low income areas/non majority white areas which could then result in over-reporting and over-supervising these areas.
+
+From the cost/benefit analysis we observe that using our model can provide an economic benefit over randomly allocating inspections. Even though our model is lacking in predictive strength, it is still preferable to a random system of allocation. By generating predictions of failure from data and accessing them through our mobile app, inspectors have a better chance of catching violations earlier and improving public health and city revenue. These benefits can only increase as our model is further engineered and our app is further developed. We recommend that the city put our product into production while we continue to improve the predictions. Additionally, we recommend that other cities pursue similar methods of inspection allocation that are based on our process.
+
+# 7. References
+
+Bartsch SM, O'Shea KJ, Lee BY. The Clinical and Economic Burden of Norovirus Gastroenteritis in the United States. J Infect Dis. 2020 Nov 9;222(11):1910-1919. doi: 10.1093/infdis/jiaa292. Erratum in: J Infect Dis. 2021 Aug 16;224(4):741. PMID: 32671397; PMCID: PMC8171800.
+
+City of Chicago. Restaurant and Food Service Inspection Reports. Retrieved December 9, 2021, from https://www.chicago.gov/city/en/depts/cdph/provdrs/healthy_restaurants/svcs/restaurant_food_inspection.html.
+
+United States Food and Drug Administration. Most Common Foodborne Illnesses. Retrieved December 9, 2021, from https://www.fda.gov/files/food/published/Most-Common-Foodborne-Illnesses-%28PDF%29.pdf.
